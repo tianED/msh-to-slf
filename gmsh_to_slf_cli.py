@@ -8,7 +8,12 @@ After conversion, use interpolate_bathymetry.py to add bathymetry to the .slf.
 The output mesh.slf has IPOBO numbered in CLI row order.
 Geometry and BOTTOM are written from Gmsh XYZ at time zero.
 
-ID 1 -> 5 4 4; ID 1000 -> 2 2 2. Liquid wins at shared junction nodes.
+Default: ID 1 -> 5 4 4 2; every other ID -> 2 2 2 2.
+Override with --bc ID LIHBOR LIUBOR LIVBOR LITBOR (repeatable).
+Example: --bc 1 2 2 2 2 --bc 7 5 4 4 4 --bc 8 4 6 6 5
+Codes must be integers 0..6. At junctions, the last matching --bc wins;
+explicit rules precede defaults, and default ID 1 precedes default walls.
+Codes select boundary types; nonzero/time-varying forcing is set separately.
 Outer loops are counterclockwise, islands clockwise. N is the one-based mesh
 node index (not necessarily its original Gmsh tag); K is the CLI row number.
 Defaults match Fine.cli: LITBOR=2 and all real coefficients zero. --hbor sets
@@ -241,7 +246,24 @@ def ordered_boundary(xyz, ikle):
     return loops, boundary
 
 
-def make_cli(xyz, ikle, nodes, lines, hbor=0.0, liquid_litbor=2):
+def boundary_rules(bc, liquid_litbor=2):
+    rules = {1: (5, 4, 4, liquid_litbor)}
+    priority = [1]
+    for rule in bc or []:
+        if len(rule) != 5 or any(not isinstance(v, (int, np.integer)) for v in rule):
+            raise ValueError('Each --bc requires ID LIHBOR LIUBOR LIVBOR LITBOR integers.')
+        physical, *codes = rule
+        if physical < 0 or any(value < 0 or value > 6 for value in codes):
+            raise ValueError('Physical IDs must be nonnegative and boundary codes must be 0..6.')
+        rules[physical] = tuple(codes)
+        if physical in priority:
+            priority.remove(physical)
+        priority.append(physical)
+    return rules, priority
+
+
+def make_cli(xyz, ikle, nodes, lines, hbor=0.0, liquid_litbor=2, bc=None):
+    rules, priority = boundary_rules(bc, liquid_litbor)
     loops, edges = ordered_boundary(xyz, ikle)
     labels = {}
     for _, physical, _, first, second in lines:
@@ -251,26 +273,27 @@ def make_cli(xyz, ikle, nodes, lines, hbor=0.0, liquid_litbor=2):
     for first, second in edges:
         edge = tuple(sorted((int(first), int(second))))
         tags = labels.get(edge, set())
-        if len(tags) != 1 or not tags <= {1, 1000}:
-            raise ValueError(f'Boundary edge {edge} needs one physical ID, 1 or 1000; found {tags}.')
+        if len(tags) != 1:
+            raise ValueError(f'Boundary edge {edge} needs one physical ID; found {tags}.')
         for node in edge:
             memberships.setdefault(node, set()).update(tags)
     ipobo = np.zeros(len(xyz), dtype=np.int32)
     rows, liquid = [], 0
     for _, loop in loops:
         for node in loop:
-            is_liquid = 1 in memberships[node]
-            liquid += is_liquid
-            code = '5 4 4' if is_liquid else '2 2 2'
-            tracer = liquid_litbor if is_liquid else 2
+            selected = next((tag for tag in reversed(priority) if tag in memberships[node]), None)
+            lihbor, liubor, livbor, tracer = rules.get(selected, (2, 2, 2, 2))
+            liquid += lihbor in (4, 5)
+            code = f'{lihbor} {liubor} {livbor}' 
             k = len(rows) + 1
             ipobo[node] = k
-            rows.append(f'{code}  {hbor if is_liquid else 0.0:.9g} 0.000 0.000 0.000'
+            rows.append(f'{code}  {hbor if lihbor == 5 else 0.0:.9g} 0.000 0.000 0.000'
                         f'  {tracer}  0.000 0.000 0.000  {node + 1:10d} {k:10d}\n')
     return ''.join(rows), ipobo, loops, liquid
 
 
-def generate(mesh, slf, cli, hbor=0.0, liquid_litbor=2, overwrite=False):
+def generate(mesh, slf, cli, hbor=0.0, liquid_litbor=2, overwrite=False, bc=None):
+    boundary_rules(bc, liquid_litbor)
     cli, slf = Path(cli), Path(slf)
     if cli.suffix.lower() != '.cli' or slf.suffix.lower() != '.slf':
         raise ValueError('Output filenames must end in .slf and .cli respectively.')
@@ -283,7 +306,7 @@ def generate(mesh, slf, cli, hbor=0.0, liquid_litbor=2, overwrite=False):
         raise ValueError('HBOR must be finite.')
     xyz, ikle = read_gmsh(mesh)
     nodes, lines, _ = read_labels(mesh)
-    content, ipobo, loops, liquid = make_cli(xyz, ikle, nodes, lines, hbor, liquid_litbor)
+    content, ipobo, loops, liquid = make_cli(xyz, ikle, nodes, lines, hbor, liquid_litbor, bc)
     write_selafin(slf, xyz, ikle, ipobo, overwrite)
     with cli.open('w' if overwrite else 'x', encoding='ascii', newline='') as dst:
         dst.write(content)
@@ -300,10 +323,13 @@ def main():
     parser.add_argument('cli', type=Path, help='Output boundary .cli filename')
     parser.add_argument('--hbor', type=float, default=0.0)
     parser.add_argument('--liquid-litbor', type=int, choices=(2, 4, 5), default=2)
+    parser.add_argument('--bc', nargs=5, type=int, action='append',
+                        metavar=('ID', 'LIHBOR', 'LIUBOR', 'LIVBOR', 'LITBOR'),
+                        help='Override a physical ID; repeatable, last matching rule wins at junctions')
     parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
     try:
-        generate(args.mesh, args.slf, args.cli, args.hbor, args.liquid_litbor, args.overwrite)
+        generate(args.mesh, args.slf, args.cli, args.hbor, args.liquid_litbor, args.overwrite, args.bc)
     except (OSError, ValueError) as exc:
         parser.exit(1, f'Error: {exc}\n')
 
